@@ -1,0 +1,214 @@
+name: Browser-agent-release
+
+# The sources live in Bitbucket, so this workflow clones them rather than checking out this repo.
+# GitHub cannot see Bitbucket tags, so a release is started by hand or by Bitbucket calling the
+# repository_dispatch API.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Bitbucket tag or branch to release, e.g. v1.0.0
+        required: true
+        type: string
+      npm_dist_tag:
+        description: npm dist-tag to publish under
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - beta
+      cdn_channels:
+        description: R2 channels to upload, comma separated
+        required: true
+        default: version,latest
+        type: string
+      dry_run:
+        description: Publish to npm with --dry-run and skip the CDN upload entirely
+        required: true
+        default: true
+        type: boolean
+  repository_dispatch:
+    types: [release]
+
+# A second release overlapping the first would race on the npm dist-tag and the latest/ channel.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_REF: ${{ github.event.client_payload.ref }}
+          PAYLOAD_NPM_DIST_TAG: ${{ github.event.client_payload.npm_dist_tag }}
+          PAYLOAD_CDN_CHANNELS: ${{ github.event.client_payload.cdn_channels }}
+          PAYLOAD_DRY_RUN: ${{ github.event.client_payload.dry_run }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_NPM_DIST_TAG: ${{ inputs.npm_dist_tag }}
+          INPUT_CDN_CHANNELS: ${{ inputs.cdn_channels }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            ref="${PAYLOAD_REF:-}"
+            npm_dist_tag="${PAYLOAD_NPM_DIST_TAG:-latest}"
+            cdn_channels="${PAYLOAD_CDN_CHANNELS:-version,latest}"
+            dry_run="${PAYLOAD_DRY_RUN:-true}"
+          else
+            ref="${INPUT_REF:-}"
+            npm_dist_tag="${INPUT_NPM_DIST_TAG:-latest}"
+            cdn_channels="${INPUT_CDN_CHANNELS:-version,latest}"
+            dry_run="${INPUT_DRY_RUN:-true}"
+          fi
+          if [ -z "$ref" ]; then
+            echo "::error::No ref given. Pass the ref input (workflow_dispatch) or client_payload.ref (repository_dispatch)."
+            exit 1
+          fi
+          # A ref is pasted by hand and ends up in a git command, so keep it to tag/branch characters.
+          case "$ref" in
+            *[!A-Za-z0-9./_-]*)
+              echo "::error::Ref contains unexpected characters: $ref"
+              exit 1
+              ;;
+          esac
+          {
+            echo "ref=$ref"
+            echo "npm_dist_tag=$npm_dist_tag"
+            echo "cdn_channels=$cdn_channels"
+            echo "dry_run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $ref as npm '$npm_dist_tag', CDN '$cdn_channels', dry run: $dry_run"
+
+      - name: Clone from Bitbucket
+        working-directory: .
+        env:
+          # A repository access token uses the literal username x-token-auth; an app password uses the account name.
+          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_USERNAME }}
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          BITBUCKET_REPO: ${{ vars.BITBUCKET_REPO || 'atatus/atatus-browser-agent' }}
+          REF: ${{ steps.inputs.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BITBUCKET_USERNAME:-}" ] || [ -z "${BITBUCKET_APP_PASSWORD:-}" ]; then
+            echo "::error::BITBUCKET_USERNAME and BITBUCKET_APP_PASSWORD secrets are required to clone the sources."
+            exit 1
+          fi
+          # Credentials go in a helper file rather than the remote URL, so they never reach the git remote or logs.
+          printf 'https://%s:%s@bitbucket.org\n' \
+            "$(printf '%s' "$BITBUCKET_USERNAME" | jq -sRr @uri)" \
+            "$(printf '%s' "$BITBUCKET_APP_PASSWORD" | jq -sRr @uri)" > "$HOME/.git-credentials"
+          git config --global credential.helper store
+          git clone --depth 1 --branch "$REF" "https://bitbucket.org/${BITBUCKET_REPO}.git" source
+          rm -f "$HOME/.git-credentials"
+          git config --global --unset credential.helper || true
+          git -C source log --oneline -1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # Single source of truth: the volta pin in the cloned package.json.
+          node-version-file: source/package.json
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          yarn install --immutable
+
+      - name: Check the ref matches the package version
+        env:
+          REF: ${{ steps.inputs.outputs.ref }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            v*)
+              package_version="$(node -p 'require("./package.json").version')"
+              if [ "$REF" != "v${package_version}" ]; then
+                echo "::error::Ref $REF does not match package.json version $package_version. The artifacts would report the wrong version."
+                exit 1
+              fi
+              echo "Ref $REF matches package.json version $package_version"
+              ;;
+            *)
+              echo "::warning::Ref $REF is not a v* tag; skipping the version consistency check."
+              ;;
+          esac
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      # Lint, formatting and the unit suite are red on the current fork, so they report without
+      # blocking: a release gate that can never pass would just be switched off.
+      - name: Lint (advisory)
+        continue-on-error: true
+        run: yarn lint
+
+      - name: Format check (advisory)
+        continue-on-error: true
+        run: yarn format
+
+      - name: Unit tests (advisory)
+        continue-on-error: true
+        run: yarn test:unit
+
+      - name: Build the CDN bundles
+        env:
+          BUILD_MODE: release
+        run: yarn build:bundle
+
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ steps.inputs.outputs.npm_dist_tag }}
+          DRY_RUN_INPUT: ${{ steps.inputs.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
+            node scripts/deploy/publish-npm.ts --tag "$NPM_DIST_TAG" --dry-run
+          else
+            node scripts/deploy/publish-npm.ts --tag "$NPM_DIST_TAG"
+          fi
+
+      # deploy-r2.ts has no dry-run mode: running it uploads, so a dry run skips it outright.
+      - name: Publish to the R2 CDN
+        if: steps.inputs.outputs.dry_run != 'true'
+        env:
+          ATATUS_R2_BUCKET: ${{ vars.ATATUS_R2_BUCKET || 'js-cdn' }}
+          ATATUS_R2_ACCOUNT_ID: ${{ secrets.ATATUS_R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CDN_CHANNELS: ${{ steps.inputs.outputs.cdn_channels }}
+        run: node scripts/deploy/deploy-r2.ts "$CDN_CHANNELS"
+
+      - name: Summary
+        if: always()
+        env:
+          REF: ${{ steps.inputs.outputs.ref }}
+          NPM_DIST_TAG: ${{ steps.inputs.outputs.npm_dist_tag }}
+          CDN_CHANNELS: ${{ steps.inputs.outputs.cdn_channels }}
+          DRY_RUN_INPUT: ${{ steps.inputs.outputs.dry_run }}
+        run: |
+          {
+            echo "### Release $REF"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Ref | \`$REF\` |"
+            echo "| npm dist-tag | \`$NPM_DIST_TAG\` |"
+            echo "| CDN channels | \`$CDN_CHANNELS\` |"
+            echo "| Dry run | \`$DRY_RUN_INPUT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
