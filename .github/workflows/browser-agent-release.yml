@@ -95,21 +95,30 @@ jobs:
       - name: Clone from Bitbucket
         working-directory: .
         env:
-          # A repository access token uses the literal username x-token-auth; an app password uses the account name.
-          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_USERNAME }}
-          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          # A Bitbucket Repository Access Token authenticates as the literal username
+          # x-token-auth, with the token itself as the password. There is no account name to
+          # configure, which is the point: the token is scoped to one repository, so it cannot
+          # reach anything else in the workspace the way an account-wide app password can.
+          BITBUCKET_REPO_TOKEN: ${{ secrets.BITBUCKET_REPO_TOKEN }}
           BITBUCKET_REPO: ${{ vars.BITBUCKET_REPO || 'atatus/atatus-browser-agent' }}
           REF: ${{ steps.inputs.outputs.ref }}
         run: |
           set -euo pipefail
-          if [ -z "${BITBUCKET_USERNAME:-}" ] || [ -z "${BITBUCKET_APP_PASSWORD:-}" ]; then
-            echo "::error::BITBUCKET_USERNAME and BITBUCKET_APP_PASSWORD secrets are required to clone the sources."
+          if [ -z "${BITBUCKET_REPO_TOKEN:-}" ]; then
+            echo "::error::BITBUCKET_REPO_TOKEN is required to clone the sources."
+            echo "::error::Create a Repository Access Token on ${BITBUCKET_REPO} itself with the Repositories: Read scope. A token from another repository returns a 403 that reads as though this repository does not exist."
+            exit 1
+          fi
+          # A token pasted with a trailing newline authenticates as a different string and fails
+          # as a 403, which reads like a permissions problem rather than a malformed secret.
+          if [ "$(printf '%s' "$BITBUCKET_REPO_TOKEN" | tr -d '[:space:]')" != "$BITBUCKET_REPO_TOKEN" ]; then
+            echo "::error::BITBUCKET_REPO_TOKEN contains whitespace. Re-enter it with none."
             exit 1
           fi
           # Credentials go in a helper file rather than the remote URL, so they never reach the git remote or logs.
           printf 'https://%s:%s@bitbucket.org\n' \
-            "$(printf '%s' "$BITBUCKET_USERNAME" | jq -sRr @uri)" \
-            "$(printf '%s' "$BITBUCKET_APP_PASSWORD" | jq -sRr @uri)" > "$HOME/.git-credentials"
+            'x-token-auth' \
+            "$(printf '%s' "$BITBUCKET_REPO_TOKEN" | jq -sRr @uri)" > "$HOME/.git-credentials"
           git config --global credential.helper store
           git clone --depth 1 --branch "$REF" "https://bitbucket.org/${BITBUCKET_REPO}.git" source
           rm -f "$HOME/.git-credentials"
